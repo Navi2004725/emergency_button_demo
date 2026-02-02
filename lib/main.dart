@@ -1,5 +1,25 @@
+// import 'package:flutter/material.dart';
+// import 'pages/sos_page.dart';
+
+// void main() {
+//   runApp(const MyApp());
+// }
+
+// class MyApp extends StatelessWidget {
+//   const MyApp({super.key});
+
+//   @override
+//   Widget build(BuildContext context) {
+//     return MaterialApp(
+//       debugShowCheckedModeBanner: false,
+//       home: const SosPage(),
+//     );
+//   }
+// }
+
+
 import 'package:flutter/material.dart';
-import 'pages/sos_page.dart';
+import 'pages/detector_page.dart';
 
 void main() {
   runApp(const MyApp());
@@ -12,7 +32,7 @@ class MyApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      home: const SosPage(),
+      home: const DetectorPage(),
     );
   }
 }
