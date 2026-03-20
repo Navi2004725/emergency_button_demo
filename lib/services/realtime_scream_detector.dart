@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:math' as math;
 import 'dart:typed_data';
+import 'dart:developer' as developer;
 
 import 'package:fftea/fftea.dart';
 import 'package:flutter_sound/flutter_sound.dart';
@@ -13,12 +14,18 @@ class DetectionUpdate {
   final bool screamHit;
   final bool dangerTriggered;
   final int hitsInWindow;
+  final int hits90In4s;
+  final int hits95In2s;
+  final int hits100In1s;
 
   DetectionUpdate({
     required this.screamProb,
     required this.screamHit,
     required this.dangerTriggered,
     required this.hitsInWindow,
+    required this.hits90In4s,
+    required this.hits95In2s,
+    required this.hits100In1s,
   });
 }
 
@@ -41,19 +48,19 @@ class RealtimeScreamDetector {
   static const int fftBins = (nFft ~/ 2) + 1; // 257
 
   // Decision settings
-  final double threshold; // 0.5
-  final int historyWindow; // 4
-  final int requiredHits; // 3
-  final Duration inferenceInterval; // 500ms
+  final double threshold; // 0.9
+  final double highThreshold; // 0.95
+  final double peakThreshold; // 1.0
+  final Duration inferenceInterval; // 1000ms
 
   RealtimeScreamDetector({
-    this.threshold = 0.5,
-    this.historyWindow = 4,
-    this.requiredHits = 3,
-    this.inferenceInterval = const Duration(milliseconds: 500),
+    this.threshold = 0.9,
+    this.highThreshold = 0.95,
+    this.peakThreshold = 1.0,
+    this.inferenceInterval = const Duration(milliseconds: 1000),
   });
 
-  final FlutterSoundRecorder _recorder = FlutterSoundRecorder();
+  FlutterSoundRecorder? _recorder;
   final StreamController<Uint8List> _pcmController =
       StreamController<Uint8List>.broadcast();
 
@@ -71,9 +78,13 @@ class RealtimeScreamDetector {
 
   // For handling odd chunk boundaries (PCM16)
   int _leftoverByte = -1;
+  DateTime? _lastPcmAt;
+  bool _isRestartingRecorder = false;
 
-  // Recent hit history
-  final ListQueue<int> _recentHits = ListQueue<int>();
+  // Threshold-specific rolling hit windows.
+  final ListQueue<DateTime> _recentHits90 = ListQueue<DateTime>();
+  final ListQueue<DateTime> _recentHits95 = ListQueue<DateTime>();
+  final ListQueue<DateTime> _recentHits100 = ListQueue<DateTime>();
 
   bool _isRunning = false;
 
@@ -81,6 +92,12 @@ class RealtimeScreamDetector {
   late final Float32List _hann;
   late final List<Float32List> _melFilterBank; // [nMels][fftBins]
   late final FFT _fft;
+  late final Float32List _wavBuffer;
+  late final Float32List _logMelBuffer;
+  late final Float32List _frameBuffer;
+  late final Float32List _magBuffer;
+  late final List<List<List<List<double>>>> _inputBuffer;
+  late final List<List<double>> _outputBuffer;
 
   Future<bool> requestMicPermission() async {
     final s = await Permission.microphone.request();
@@ -98,11 +115,28 @@ class RealtimeScreamDetector {
       fMax: fMax,
     );
     _fft = FFT(nFft);
+    _wavBuffer = Float32List(windowSamples);
+    _logMelBuffer = Float32List(frames * nMels);
+    _frameBuffer = Float32List(nFft);
+    _magBuffer = Float32List(fftBins);
+    _inputBuffer = List.generate(
+      1,
+      (_) => List.generate(
+        frames,
+        (_) => List.generate(
+          nMels,
+          (_) => [0.0],
+        ),
+      ),
+    );
+    _outputBuffer = [
+      [0.0]
+    ];
 
     // Load TFLite model (logmel input)
-    final options = InterpreterOptions()..threads = 4;
+    final options = InterpreterOptions()..threads = 1;
     _interpreter = await Interpreter.fromAsset(
-      'assets/models/scream_logmel.tflite',
+      'assets/models/scream_logmel_best.tflite',
       options: options,
     );
 
@@ -118,12 +152,17 @@ class RealtimeScreamDetector {
 
   Future<void> start(void Function(DetectionUpdate) onUpdate) async {
     if (_isRunning) return;
+    developer.log('FlutterSoundRecorder start requested', name: 'RealtimeScreamDetector');
     _isRunning = true;
 
     // Reset state
-    _recentHits.clear();
+    _recentHits90.clear();
+    _recentHits95.clear();
+    _recentHits100.clear();
     _samplesSeen = 0;
     _leftoverByte = -1;
+    _lastPcmAt = null;
+    _isRestartingRecorder = false;
     _ringIndex = 0;
     for (int i = 0; i < _ring.length; i++) {
       _ring[i] = 0.0;
@@ -134,34 +173,59 @@ class RealtimeScreamDetector {
         await initModel();
       }
 
-      await _recorder.openRecorder();
+      _recorder ??= FlutterSoundRecorder();
+      await _recorder!.openRecorder();
+      developer.log('FlutterSoundRecorder opened', name: 'RealtimeScreamDetector');
 
-      await _recorder.startRecorder(
+      await _recorder!.startRecorder(
         toStream: _pcmController.sink,
         codec: Codec.pcm16,
         numChannels: 1,
         sampleRate: sampleRate,
       );
+      developer.log('FlutterSoundRecorder started', name: 'RealtimeScreamDetector');
 
       _pcmSub = _pcmController.stream.listen(_onPcmChunk);
 
       _timer = Timer.periodic(inferenceInterval, (_) {
         if (_samplesSeen < windowSamples) return;
 
+        final now = DateTime.now();
+        final staleCutoff = Duration(
+          milliseconds: (inferenceInterval.inMilliseconds * 3).clamp(1500, 5000),
+        );
+        if (!_isRestartingRecorder &&
+            _lastPcmAt != null &&
+            now.difference(_lastPcmAt!) > staleCutoff) {
+          unawaited(_restartRecorderStream());
+          return;
+        }
+
         final prob = _runInference();
-        final hit = (prob >= threshold) ? 1 : 0;
+        final hitRecorded = prob >= threshold;
+        if (prob >= threshold) _recentHits90.add(now);
+        if (prob >= highThreshold) _recentHits95.add(now);
+        if (prob >= peakThreshold) _recentHits100.add(now);
 
-        _recentHits.add(hit);
-        if (_recentHits.length > historyWindow) _recentHits.removeFirst();
+        _pruneHits(_recentHits90, now, const Duration(seconds: 4));
+        _pruneHits(_recentHits95, now, const Duration(seconds: 2));
+        _pruneHits(_recentHits100, now, const Duration(seconds: 1));
 
-        final hits = _recentHits.fold<int>(0, (a, b) => a + b);
-        final danger = hits >= requiredHits;
+        final hits90 = _recentHits90.length;
+        final hits95 = _recentHits95.length;
+        final hits100 = _recentHits100.length;
+        final danger = hits90 >= 4 ||
+            hits95 >= 2 ||
+            hits100 >= 1;
 
         onUpdate(DetectionUpdate(
           screamProb: prob,
-          screamHit: hit == 1,
+          screamHit: hitRecorded,
           dangerTriggered: danger,
-          hitsInWindow: hits,
+          hitsInWindow: hits90,
+          hits90In4s: hits90,
+          hits95In2s: hits95,
+          hits100In1s: hits100,
         ));
       });
     } catch (_) {
@@ -171,8 +235,19 @@ class RealtimeScreamDetector {
     }
   }
 
+  void _pruneHits(
+    ListQueue<DateTime> hits,
+    DateTime now,
+    Duration window,
+  ) {
+    while (hits.isNotEmpty && now.difference(hits.first) > window) {
+      hits.removeFirst();
+    }
+  }
+
   void _onPcmChunk(Uint8List u8) {
     if (u8.isEmpty) return;
+    _lastPcmAt = DateTime.now();
 
     int i = 0;
 
@@ -218,58 +293,101 @@ class RealtimeScreamDetector {
     final interpreter = _interpreter!;
 
     // 1) get waveform window
-    final wav = _getLatestWindow();
+    _copyLatestWindow(_wavBuffer);
 
     // 2) compute log-mel [frames, nMels, 1] flattened
-    final logmel = _computeLogMel(wav); // Float32List length frames*nMels
+    _computeLogMel(_wavBuffer, _logMelBuffer);
 
     // 3) input shape [1,frames,nMels,1]
-    final input = logmel.reshape([1, frames, nMels, 1]);
+    int idx = 0;
+    for (int f = 0; f < frames; f++) {
+      for (int m = 0; m < nMels; m++) {
+        _inputBuffer[0][f][m][0] = _logMelBuffer[idx++].toDouble();
+      }
+    }
 
-    // output [1,1]
-    final output = List.generate(1, (_) => List.filled(1, 0.0));
+    _outputBuffer[0][0] = 0.0;
+    interpreter.run(_inputBuffer, _outputBuffer);
 
-    interpreter.run(input, output);
-
-    final p = (output[0][0] as num).toDouble();
+    final p = (_outputBuffer[0][0] as num).toDouble();
     if (p.isNaN || p.isInfinite) return 0.0;
     return p.clamp(0.0, 1.0);
   }
 
-  Float32List _getLatestWindow() {
-    final out = Float32List(windowSamples);
+  Future<void> _restartRecorderStream() async {
+    if (!_isRunning || _isRestartingRecorder) return;
+    developer.log('FlutterSoundRecorder restart begin', name: 'RealtimeScreamDetector');
+    _isRestartingRecorder = true;
+
+    try {
+      await _pcmSub?.cancel();
+      _pcmSub = null;
+
+      try { await _recorder?.stopRecorder(); } catch (_) {}
+      try { await _recorder?.closeRecorder(); } catch (_) {}
+
+      _leftoverByte = -1;
+      _lastPcmAt = null;
+
+      _recorder ??= FlutterSoundRecorder();
+      await _recorder!.openRecorder();
+      developer.log('FlutterSoundRecorder reopened', name: 'RealtimeScreamDetector');
+      await _recorder!.startRecorder(
+        toStream: _pcmController.sink,
+        codec: Codec.pcm16,
+        numChannels: 1,
+        sampleRate: sampleRate,
+      );
+      developer.log('FlutterSoundRecorder restarted', name: 'RealtimeScreamDetector');
+
+      _pcmSub = _pcmController.stream.listen(_onPcmChunk);
+    } finally {
+      developer.log('FlutterSoundRecorder restart end', name: 'RealtimeScreamDetector');
+      _isRestartingRecorder = false;
+    }
+  }
+
+  Future<void> recoverIfStreamStale() async {
+    if (!_isRunning || _isRestartingRecorder) return;
+    final lastPcmAt = _lastPcmAt;
+    if (lastPcmAt == null) {
+      await _restartRecorderStream();
+      return;
+    }
+
+    final staleCutoff = Duration(
+      milliseconds: (inferenceInterval.inMilliseconds * 3).clamp(1500, 5000),
+    );
+    if (DateTime.now().difference(lastPcmAt) > staleCutoff) {
+      await _restartRecorderStream();
+    }
+  }
+
+  void _copyLatestWindow(Float32List out) {
     int idx = _ringIndex;
     for (int i = 0; i < windowSamples; i++) {
       out[i] = _ring[idx];
       idx = (idx + 1) % windowSamples;
     }
-    return out;
   }
 
-  Float32List _computeLogMel(Float32List wav) {
-    // Output: frames*nMels
-    final out = Float32List(frames * nMels);
-
-    // scratch buffers
-    final frame = Float32List(nFft);
-    final mag = Float32List(fftBins);
-
+  void _computeLogMel(Float32List wav, Float32List out) {
     for (int f = 0; f < frames; f++) {
       final start = f * hop;
 
       // copy frame + hann
       for (int i = 0; i < nFft; i++) {
-        frame[i] = wav[start + i] * _hann[i];
+        _frameBuffer[i] = wav[start + i] * _hann[i];
       }
 
       // FFT (complex)
-      final freq = _fft.realFft(frame); // List<Float64x2> internally
+      final freq = _fft.realFft(_frameBuffer); // List<Float64x2> internally
       // magnitude for first fftBins
       for (int k = 0; k < fftBins; k++) {
         final c = freq[k];
         final re = c.x;
         final im = c.y;
-        mag[k] = math.sqrt(re * re + im * im).toDouble();
+        _magBuffer[k] = math.sqrt(re * re + im * im).toDouble();
       }
 
       // mel energies
@@ -277,21 +395,20 @@ class RealtimeScreamDetector {
         final filt = _melFilterBank[m];
         double e = 0.0;
         for (int k = 0; k < fftBins; k++) {
-          e += mag[k] * filt[k];
+          e += _magBuffer[k] * filt[k];
         }
         final loge = math.log(e + eps);
         out[f * nMels + m] = loge.toDouble();
       }
     }
-
-    return out;
   }
 
   Future<void> stop() async {
     if (!_isRunning) {
-      try { await _recorder.closeRecorder(); } catch (_) {}
+      try { await _recorder?.closeRecorder(); } catch (_) {}
       return;
     }
+    developer.log('FlutterSoundRecorder stop requested', name: 'RealtimeScreamDetector');
     _isRunning = false;
 
     _timer?.cancel();
@@ -302,14 +419,16 @@ class RealtimeScreamDetector {
 
     _leftoverByte = -1;
 
-    try { await _recorder.stopRecorder(); } catch (_) {}
-    try { await _recorder.closeRecorder(); } catch (_) {}
+    try { await _recorder?.stopRecorder(); } catch (_) {}
+    try { await _recorder?.closeRecorder(); } catch (_) {}
+    developer.log('FlutterSoundRecorder stopped and closed', name: 'RealtimeScreamDetector');
   }
 
   Future<void> dispose() async {
     await stop();
     _interpreter?.close();
     _interpreter = null;
+    _recorder = null;
     await _pcmController.close();
   }
 
@@ -372,25 +491,5 @@ double _melToHz(double mel) =>
     }
 
     return filters;
-  }
-}
-
-// Small helper to reshape flat Float32List for interpreter input
-extension _Reshape on Float32List {
-  List<List<List<List<double>>>> reshape(List<int> shape) {
-    // shape = [1,frames,nMels,1]
-    final f = shape[1];
-    final m = shape[2];
-
-    int idx = 0;
-    final out = List.generate(1, (_) {
-      return List.generate(f, (_) {
-        return List.generate(m, (_) {
-          final v = this[idx++].toDouble();
-          return [v];
-        });
-      });
-    });
-    return out;
   }
 }
